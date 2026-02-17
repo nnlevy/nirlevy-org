@@ -1,0 +1,112 @@
+name: codex autopmerge
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+
+jobs:
+  codex-automerge:
+    name: Enable or apply Codex auto-merge
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.pull_request.draft == false &&
+      contains(github.event.pull_request.labels.*.name, 'automerge') &&
+      (github.event.sender.login == 'chatgpt-codex-connector' || startsWith(github.event.pull_request.head.ref, 'codex/'))
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: read
+      actions: read
+    steps:
+      - name: Evaluate file changes and apply merge
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const denylist = [
+              '**/*wrangler*.{json,toml}',
+              '**/.github/workflows/**',
+              '**/src/**/stripe*',
+              '**/src/**/payments*',
+              '**/src/**/auth*',
+              '**/src/**/sessions*',
+              '**/src/**/worker/**/env*',
+              '**/routing/**',
+              '**/redirect',
+              '**/canonical',
+              '**/migrations/**',
+              '**/*.sql',
+            ];
+
+            const { owner, repo } = context.repo;
+            const pull_number = context.payload.pull_request.number;
+
+            function globToRegex(glob) {
+              let out = String(glob)
+                .replace(/[.+^${}()|[\]\]/g, '\\$&')
+                .replace(/\{([^}]+)\}/g, (_m, alts) => `(?:${alts.split(',').join('|')})`)
+                .replace(/\*\*/g, '.*')
+                .replace(/\*/g, '[^/]*')
+                .replace(/\?/g, '.');
+              return new RegExp(`^${out}$`);
+            }
+
+            function isDenied(path) {
+              return denylist.some((pattern) => globToRegex(pattern).test(path));
+            }
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number,
+              per_page: 100,
+            });
+
+            const denied = files.filter((f) => isDenied(f.filename));
+            if (denied.length) {
+              console.log(`Codex safe-merge skipped: denied file changes detected. files=${denied.map((f) => f.filename).join(', ')}`);
+              return;
+            }
+
+            let pr = await github.rest.pulls.get({ owner, repo, pull_number }).then((res) => res.data);
+
+            try {
+              await github.rest.pulls.enablePullRequestAutoMerge({
+                owner,
+                repo,
+                pull_number,
+                merge_method: 'squash',
+              });
+              console.log('Enabled GitHub PR auto-merge (squash).');
+              return;
+            } catch (err) {
+              const code = err.status || err.statusCode || 0;
+              console.log(`Auto-merge unavailable (${code}): ${err.message}`);
+
+              if (![422, 405, 403].includes(code)) {
+                throw err;
+              }
+            }
+
+            pr = await github.rest.pulls.get({ owner, repo, pull_number }).then((res) => res.data);
+            if (!pr.mergeable) {
+              console.log('PR is not mergeable, skipping fallback merge.');
+              return;
+            }
+            if (pr.mergeable_state !== 'clean') {
+              console.log(`Branch protections/check state not clean (${pr.mergeable_state}), skipping fallback merge.`);
+              return;
+            }
+
+            try {
+              await github.rest.pulls.merge({
+                owner,
+                repo,
+                pull_number,
+                merge_method: 'squash',
+              });
+              console.log('Fallback merge via API completed.');
+            } catch (err) {
+              const message = err.message || String(err);
+              console.log(`Fallback merge failed: ${message}`);
+            }
