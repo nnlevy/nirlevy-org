@@ -1,0 +1,142 @@
+name: Codex Safe Automerge
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - labeled
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  statuses: read
+
+jobs:
+  codex-automerge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce Codex automerge safety policy
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const repo = context.payload.repository;
+
+            if (!pr) {
+              core.info('No pull_request payload in context.');
+              return;
+            }
+
+            const labels = Array.from(pr.labels || []).map((label) => label.name);
+            const hasAutomergeLabel = labels.includes('automerge');
+            const isNotDraft = pr.draft === false;
+            const isCodexAuthor = pr.user && pr.user.login === 'chatgpt-codex-connector';
+            const isCodexBranch = typeof pr.head?.ref === 'string' && pr.head.ref.startsWith('codex/');
+
+            if (!hasAutomergeLabel || !isNotDraft || !(isCodexAuthor || isCodexBranch)) {
+              core.info(`Skipping automerge. hasAutomergeLabel=${hasAutomergeLabel}, isNotDraft=${isNotDraft}, isCodexAuthor=${isCodexAuthor}, isCodexBranch=${isCodexBranch}`);
+              return;
+            }
+
+            let minimatchFn = null;
+            try {
+              const minimatch = require('minimatch');
+              minimatchFn = (path, pattern) => minimatch.minimatch(path, pattern, { dot: true });
+            } catch (error) {
+              core.warning(`minimatch not available: ${error.message}`);
+            }
+
+            const denyPatterns = [
+              '**/*.sql',
+              '**/.github/workflows/**',
+              '**/*wrangler*.{json,toml}',
+              '**/src/**/stripe*',
+              '**/src/**/payments*',
+              '**/src/**/auth*',
+              '**/src/**/sessions*',
+              '**/src/**/worker/**/env*',
+              '**/routing/**',
+              '**/redirect',
+              '**/canonical',
+              '**/migrations/**',
+            ];
+
+            const fallbackDeny = (path) => {
+              if (!path) return false;
+              return (
+                /(^|\/)\.github\/workflows\//.test(path) ||
+                /(^|\/)src\/(.+\/)?stripe[^/]*$/.test(path) ||
+                /(^|\/)src\/(.+\/)?payments[^/]*$/.test(path) ||
+                /(^|\/)src\/(.+\/)?auth[^/]*$/.test(path) ||
+                /(^|\/)src\/(.+\/)?sessions[^/]*$/.test(path) ||
+                /(^|\/)src\/(.+\/)?worker\/(.+\/)?env[^/]*$/.test(path) ||
+                /(^|\/)routing(\/|$)/.test(path) ||
+                /(^|\/)redirect(\/|$)/.test(path) ||
+                /(^|\/)canonical(\/|$)/.test(path) ||
+                /(^|\/)migrations(\/|$)/.test(path) ||
+                /wrangler[^/]*\.(json|toml)$/.test(path) ||
+                /\.sql$/.test(path)
+              );
+            };
+
+            const isDenied = (path) => {
+              if (minimatchFn) {
+                return denyPatterns.some((pattern) => minimatchFn(path, pattern));
+              }
+              return fallbackDeny(path);
+            };
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: repo.owner.login,
+              repo: repo.name,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            const changedFiles = files.map((file) => file.filename || '');
+            const denyMatches = [...new Set(changedFiles.filter(isDenied))];
+            if (denyMatches.length > 0) {
+              core.info(`Denylist match. Not enabling automerge. Blocked files: ${denyMatches.join(', ')}`);
+              return;
+            }
+
+            try {
+              await github.graphql(
+                `mutation($pullRequestId: ID!) {
+                  enablePullRequestAutoMerge(input: {
+                    pullRequestId: $pullRequestId
+                    mergeMethod: SQUASH
+                    clientMutationId: "codex-automerge"
+                  }) { clientMutationId }
+                }`,
+                {
+                  pullRequestId: pr.node_id,
+                }
+              );
+              core.info('Enabled PR auto-merge (squash).');
+              return;
+            } catch (error) {
+              core.warning(`Auto-merge enable failed; attempting fallback merge path. ${error.message}`);
+            }
+
+            const current = await github.rest.pulls.get({
+              owner: repo.owner.login,
+              repo: repo.name,
+              pull_number: pr.number,
+            });
+
+            if (current.data.mergeable === true && current.data.mergeable_state === 'clean') {
+              const merged = await github.rest.pulls.merge({
+                owner: repo.owner.login,
+                repo: repo.name,
+                pull_number: pr.number,
+                merge_method: 'squash',
+              });
+              core.info(`Fallback merge API result: merged=${merged.data.merged}, sha=${merged.data.sha || 'n/a'}`);
+            } else {
+              core.info(`Fallback merge skipped: mergeable=${current.data.mergeable}, state=${current.data.mergeable_state}`);
+            }
